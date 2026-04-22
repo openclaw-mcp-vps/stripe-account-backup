@@ -1,379 +1,310 @@
-import crypto from "node:crypto";
-import fs from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { randomUUID } from "node:crypto";
+import type { BackupKind, BackupStatus } from "@/types/stripe-data";
 
-const DATA_DIRECTORY = path.join(process.cwd(), ".local-data");
-const DATABASE_PATH = path.join(DATA_DIRECTORY, "database.json");
+const DATABASE_PATH = path.join(process.cwd(), "data", "database.json");
 
-export type BackupStatus = "running" | "complete" | "failed";
-
-export type UserRecord = {
-  id: string;
+export interface UserRecord {
   email: string;
-  createdAt: string;
-  paidAt: string;
-};
-
-export type PaymentRecord = {
-  id: string;
-  email: string;
-  stripeSessionId: string;
-  amountTotal: number;
-  currency: string;
-  createdAt: string;
-};
-
-export type StripeConnectionRecord = {
-  userId: string;
-  stripeUserId: string;
-  accessToken: string;
-  refreshToken: string | null;
-  scope: string;
-  livemode: boolean;
-  accountDisplayName: string | null;
-  accountEmail: string | null;
-  autoBackupEnabled: boolean;
+  stripeAccountId: string;
+  stripeAccessToken: string;
+  stripeRefreshToken: string;
+  stripeScope: string;
+  stripeLivemode: boolean;
   connectedAt: string;
   updatedAt: string;
-};
+}
 
-export type BackupSummary = {
-  charges: number;
-  customers: number;
-  subscriptions: number;
-  payouts: number;
-  balanceTransactions: number;
-  invoices: number;
-};
-
-export type BackupRecord = {
+export interface PaymentRecord {
   id: string;
-  userId: string;
-  status: BackupStatus;
-  fileName: string;
-  storageKey: string | null;
-  sizeBytes: number | null;
-  startedAt: string;
-  completedAt: string | null;
-  error: string | null;
-  summary: BackupSummary | null;
-};
+  email: string;
+  source: "stripe" | "lemonsqueezy";
+  status: "paid" | "refunded" | "active";
+  eventId: string;
+  amount: number | null;
+  currency: string | null;
+  paidAt: string;
+}
 
-type DatabaseSchema = {
+export interface BackupRecord {
+  id: string;
+  email: string;
+  kind: BackupKind;
+  status: BackupStatus;
+  createdAt: string;
+  updatedAt: string;
+  fileName: string;
+  storageProvider: "local" | "s3";
+  storagePath: string;
+  sizeBytes: number;
+  error: string | null;
+}
+
+interface DatabaseShape {
   users: UserRecord[];
   payments: PaymentRecord[];
-  stripeConnections: StripeConnectionRecord[];
   backups: BackupRecord[];
-};
+}
 
-const EMPTY_DATABASE: DatabaseSchema = {
+const EMPTY_DATABASE: DatabaseShape = {
   users: [],
   payments: [],
-  stripeConnections: [],
   backups: []
 };
 
-let queue: Promise<unknown> = Promise.resolve();
+let writeQueue = Promise.resolve();
 
-function normalizeEmail(email: string) {
+function normalizeEmail(email: string): string {
   return email.trim().toLowerCase();
 }
 
-async function withDatabaseLock<T>(operation: () => Promise<T>) {
-  const run = queue.then(operation, operation);
-  queue = run.then(
-    () => undefined,
-    () => undefined
-  );
-  return run;
-}
-
-async function ensureDatabaseExists() {
-  await fs.mkdir(DATA_DIRECTORY, { recursive: true });
+async function ensureDatabaseFile(): Promise<void> {
+  await mkdir(path.dirname(DATABASE_PATH), { recursive: true });
 
   try {
-    await fs.access(DATABASE_PATH);
+    await readFile(DATABASE_PATH, "utf-8");
   } catch {
-    await fs.writeFile(DATABASE_PATH, JSON.stringify(EMPTY_DATABASE, null, 2), "utf8");
+    await writeFile(DATABASE_PATH, JSON.stringify(EMPTY_DATABASE, null, 2), "utf-8");
   }
 }
 
-async function readDatabase() {
-  await ensureDatabaseExists();
-  const content = await fs.readFile(DATABASE_PATH, "utf8");
+async function readDatabase(): Promise<DatabaseShape> {
+  await ensureDatabaseFile();
+  const raw = await readFile(DATABASE_PATH, "utf-8");
 
   try {
-    const parsed = JSON.parse(content) as Partial<DatabaseSchema>;
+    const parsed = JSON.parse(raw) as DatabaseShape;
+
     return {
       users: parsed.users ?? [],
       payments: parsed.payments ?? [],
-      stripeConnections: parsed.stripeConnections ?? [],
       backups: parsed.backups ?? []
-    } satisfies DatabaseSchema;
+    };
   } catch {
-    return { ...EMPTY_DATABASE };
+    return EMPTY_DATABASE;
   }
 }
 
-async function writeDatabase(database: DatabaseSchema) {
-  await fs.writeFile(DATABASE_PATH, JSON.stringify(database, null, 2), "utf8");
+async function writeDatabase(database: DatabaseShape): Promise<void> {
+  await writeFile(DATABASE_PATH, JSON.stringify(database, null, 2), "utf-8");
 }
 
-export async function findPaidUserByEmail(email: string) {
-  const normalized = normalizeEmail(email);
-  const database = await readDatabase();
-  return database.users.find((user) => user.email === normalized) ?? null;
-}
-
-export async function findPaidUserById(id: string) {
-  const database = await readDatabase();
-  return database.users.find((user) => user.id === id) ?? null;
-}
-
-export async function grantPaidAccessByEmail(email: string) {
-  return withDatabaseLock(async () => {
-    const normalized = normalizeEmail(email);
-    const database = await readDatabase();
-
-    const existing = database.users.find((user) => user.email === normalized);
-    if (existing) {
-      if (!existing.paidAt) {
-        existing.paidAt = new Date().toISOString();
-      }
-      await writeDatabase(database);
-      return existing;
-    }
-
-    const user: UserRecord = {
-      id: crypto.randomUUID(),
-      email: normalized,
-      createdAt: new Date().toISOString(),
-      paidAt: new Date().toISOString()
-    };
-
-    database.users.push(user);
-    await writeDatabase(database);
-    return user;
+async function withWriteLock<T>(operation: (database: DatabaseShape) => Promise<T> | T): Promise<T> {
+  let resolveNext: (() => void) | undefined;
+  const gate = new Promise<void>((resolve) => {
+    resolveNext = resolve;
   });
+
+  const previous = writeQueue;
+  writeQueue = previous.then(() => gate);
+  await previous;
+
+  try {
+    const database = await readDatabase();
+    const result = await operation(database);
+    await writeDatabase(database);
+
+    return result;
+  } finally {
+    resolveNext?.();
+  }
 }
 
-export async function recordStripePayment(params: {
+export async function getUserByEmail(email: string): Promise<UserRecord | null> {
+  const target = normalizeEmail(email);
+  const database = await readDatabase();
+
+  return database.users.find((user) => user.email === target) ?? null;
+}
+
+export async function upsertStripeConnection(input: {
   email: string;
-  stripeSessionId: string;
-  amountTotal: number;
-  currency: string;
-}) {
-  return withDatabaseLock(async () => {
-    const normalized = normalizeEmail(params.email);
-    const database = await readDatabase();
+  stripeAccountId: string;
+  stripeAccessToken: string;
+  stripeRefreshToken: string;
+  stripeScope: string;
+  stripeLivemode: boolean;
+}): Promise<UserRecord> {
+  const email = normalizeEmail(input.email);
 
-    const existingPayment = database.payments.find(
-      (payment) => payment.stripeSessionId === params.stripeSessionId
-    );
-
-    if (!existingPayment) {
-      const payment: PaymentRecord = {
-        id: crypto.randomUUID(),
-        email: normalized,
-        stripeSessionId: params.stripeSessionId,
-        amountTotal: params.amountTotal,
-        currency: params.currency,
-        createdAt: new Date().toISOString()
-      };
-      database.payments.push(payment);
-    }
-
-    let user = database.users.find((entry) => entry.email === normalized);
-    if (!user) {
-      user = {
-        id: crypto.randomUUID(),
-        email: normalized,
-        createdAt: new Date().toISOString(),
-        paidAt: new Date().toISOString()
-      };
-      database.users.push(user);
-    }
-
-    if (!user.paidAt) {
-      user.paidAt = new Date().toISOString();
-    }
-
-    await writeDatabase(database);
-    return user;
-  });
-}
-
-export async function listPaymentsByEmail(email: string) {
-  const normalized = normalizeEmail(email);
-  const database = await readDatabase();
-  return database.payments.filter((payment) => payment.email === normalized);
-}
-
-export async function upsertStripeConnection(connection: {
-  userId: string;
-  stripeUserId: string;
-  accessToken: string;
-  refreshToken: string | null;
-  scope: string;
-  livemode: boolean;
-  accountDisplayName: string | null;
-  accountEmail: string | null;
-  autoBackupEnabled?: boolean;
-}) {
-  return withDatabaseLock(async () => {
-    const database = await readDatabase();
-
-    const existing = database.stripeConnections.find(
-      (entry) => entry.userId === connection.userId
-    );
-
+  return withWriteLock((database) => {
     const now = new Date().toISOString();
+    const existing = database.users.find((user) => user.email === email);
 
     if (existing) {
-      existing.stripeUserId = connection.stripeUserId;
-      existing.accessToken = connection.accessToken;
-      existing.refreshToken = connection.refreshToken;
-      existing.scope = connection.scope;
-      existing.livemode = connection.livemode;
-      existing.accountDisplayName = connection.accountDisplayName;
-      existing.accountEmail = connection.accountEmail;
-      existing.autoBackupEnabled = connection.autoBackupEnabled ?? existing.autoBackupEnabled;
+      existing.stripeAccountId = input.stripeAccountId;
+      existing.stripeAccessToken = input.stripeAccessToken;
+      existing.stripeRefreshToken = input.stripeRefreshToken;
+      existing.stripeScope = input.stripeScope;
+      existing.stripeLivemode = input.stripeLivemode;
       existing.updatedAt = now;
-      await writeDatabase(database);
+
       return existing;
     }
 
-    const created: StripeConnectionRecord = {
-      userId: connection.userId,
-      stripeUserId: connection.stripeUserId,
-      accessToken: connection.accessToken,
-      refreshToken: connection.refreshToken,
-      scope: connection.scope,
-      livemode: connection.livemode,
-      accountDisplayName: connection.accountDisplayName,
-      accountEmail: connection.accountEmail,
-      autoBackupEnabled: connection.autoBackupEnabled ?? true,
+    const created: UserRecord = {
+      email,
+      stripeAccountId: input.stripeAccountId,
+      stripeAccessToken: input.stripeAccessToken,
+      stripeRefreshToken: input.stripeRefreshToken,
+      stripeScope: input.stripeScope,
+      stripeLivemode: input.stripeLivemode,
       connectedAt: now,
       updatedAt: now
     };
 
-    database.stripeConnections.push(created);
-    await writeDatabase(database);
+    database.users.push(created);
+
     return created;
   });
 }
 
-export async function getStripeConnectionByUserId(userId: string) {
-  const database = await readDatabase();
-  return database.stripeConnections.find((entry) => entry.userId === userId) ?? null;
-}
+export async function recordPayment(input: {
+  email: string;
+  source: "stripe" | "lemonsqueezy";
+  status: "paid" | "refunded" | "active";
+  eventId: string;
+  amount: number | null;
+  currency: string | null;
+  paidAt?: string;
+}): Promise<PaymentRecord> {
+  const email = normalizeEmail(input.email);
 
-export async function removeStripeConnectionByStripeUserId(stripeUserId: string) {
-  return withDatabaseLock(async () => {
-    const database = await readDatabase();
-    database.stripeConnections = database.stripeConnections.filter(
-      (entry) => entry.stripeUserId !== stripeUserId
-    );
-    await writeDatabase(database);
+  return withWriteLock((database) => {
+    const existing = database.payments.find((payment) => payment.eventId === input.eventId);
+
+    if (existing) {
+      return existing;
+    }
+
+    const payment: PaymentRecord = {
+      id: randomUUID(),
+      email,
+      source: input.source,
+      status: input.status,
+      eventId: input.eventId,
+      amount: input.amount,
+      currency: input.currency,
+      paidAt: input.paidAt ?? new Date().toISOString()
+    };
+
+    database.payments.push(payment);
+
+    return payment;
   });
 }
 
-export async function createBackupRecord(userId: string) {
-  return withDatabaseLock(async () => {
-    const database = await readDatabase();
+export async function hasPaidAccess(email: string): Promise<boolean> {
+  const target = normalizeEmail(email);
+  const database = await readDatabase();
+
+  return database.payments.some(
+    (payment) => payment.email === target && (payment.status === "paid" || payment.status === "active")
+  );
+}
+
+export async function createBackupRecord(input: {
+  email: string;
+  kind: BackupKind;
+  fileName: string;
+}): Promise<BackupRecord> {
+  const email = normalizeEmail(input.email);
+
+  return withWriteLock((database) => {
     const now = new Date().toISOString();
     const record: BackupRecord = {
-      id: crypto.randomUUID(),
-      userId,
+      id: randomUUID(),
+      email,
+      kind: input.kind,
       status: "running",
-      fileName: "",
-      storageKey: null,
-      sizeBytes: null,
-      startedAt: now,
-      completedAt: null,
-      error: null,
-      summary: null
+      createdAt: now,
+      updatedAt: now,
+      fileName: input.fileName,
+      storageProvider: "local",
+      storagePath: "",
+      sizeBytes: 0,
+      error: null
     };
 
     database.backups.push(record);
-    await writeDatabase(database);
+
     return record;
   });
 }
 
-export async function completeBackupRecord(
-  backupId: string,
-  values: {
-    fileName: string;
-    storageKey: string;
-    sizeBytes: number;
-    summary: BackupSummary;
-  }
-) {
-  return withDatabaseLock(async () => {
-    const database = await readDatabase();
-    const backup = database.backups.find((entry) => entry.id === backupId);
-    if (!backup) {
+export async function completeBackupRecord(input: {
+  backupId: string;
+  email: string;
+  storageProvider: "local" | "s3";
+  storagePath: string;
+  sizeBytes: number;
+}): Promise<BackupRecord | null> {
+  const email = normalizeEmail(input.email);
+
+  return withWriteLock((database) => {
+    const record = database.backups.find((backup) => backup.id === input.backupId && backup.email === email);
+
+    if (!record) {
       return null;
     }
 
-    backup.status = "complete";
-    backup.fileName = values.fileName;
-    backup.storageKey = values.storageKey;
-    backup.sizeBytes = values.sizeBytes;
-    backup.summary = values.summary;
-    backup.completedAt = new Date().toISOString();
-    backup.error = null;
+    record.status = "completed";
+    record.updatedAt = new Date().toISOString();
+    record.storageProvider = input.storageProvider;
+    record.storagePath = input.storagePath;
+    record.sizeBytes = input.sizeBytes;
+    record.error = null;
 
-    await writeDatabase(database);
-    return backup;
+    return record;
   });
 }
 
-export async function failBackupRecord(backupId: string, error: string) {
-  return withDatabaseLock(async () => {
-    const database = await readDatabase();
-    const backup = database.backups.find((entry) => entry.id === backupId);
-    if (!backup) {
+export async function failBackupRecord(input: {
+  backupId: string;
+  email: string;
+  error: string;
+}): Promise<BackupRecord | null> {
+  const email = normalizeEmail(input.email);
+
+  return withWriteLock((database) => {
+    const record = database.backups.find((backup) => backup.id === input.backupId && backup.email === email);
+
+    if (!record) {
       return null;
     }
 
-    backup.status = "failed";
-    backup.error = error;
-    backup.completedAt = new Date().toISOString();
+    record.status = "failed";
+    record.updatedAt = new Date().toISOString();
+    record.error = input.error;
 
-    await writeDatabase(database);
-    return backup;
+    return record;
   });
 }
 
-export async function listBackupsForUser(userId: string) {
+export async function listBackupsByEmail(email: string): Promise<BackupRecord[]> {
+  const target = normalizeEmail(email);
   const database = await readDatabase();
+
   return database.backups
-    .filter((backup) => backup.userId === userId)
-    .sort((a, b) => (a.startedAt > b.startedAt ? -1 : 1));
+    .filter((backup) => backup.email === target)
+    .sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
 }
 
-export async function getBackupByIdForUser(backupId: string, userId: string) {
+export async function getBackupById(email: string, backupId: string): Promise<BackupRecord | null> {
+  const target = normalizeEmail(email);
   const database = await readDatabase();
-  return (
-    database.backups.find((backup) => backup.id === backupId && backup.userId === userId) ?? null
+
+  return database.backups.find((backup) => backup.email === target && backup.id === backupId) ?? null;
+}
+
+export async function listPaidConnectedUsers(): Promise<UserRecord[]> {
+  const database = await readDatabase();
+  const eligibleEmails = new Set(
+    database.payments
+      .filter((payment) => payment.status === "paid" || payment.status === "active")
+      .map((payment) => payment.email)
   );
-}
 
-export async function listConnectedPaidUsers() {
-  const database = await readDatabase();
-  const paidUserIds = new Set(database.users.map((user) => user.id));
-
-  return database.stripeConnections
-    .filter((connection) => paidUserIds.has(connection.userId) && connection.autoBackupEnabled)
-    .map((connection) => ({
-      user: database.users.find((user) => user.id === connection.userId)!,
-      connection
-    }));
-}
-
-export async function getBackupCountForUser(userId: string) {
-  const backups = await listBackupsForUser(userId);
-  return backups.length;
+  return database.users.filter((user) => eligibleEmails.has(user.email));
 }

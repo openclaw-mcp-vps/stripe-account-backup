@@ -1,221 +1,127 @@
-import Link from "next/link";
-
-import { Button, buttonVariants } from "@/components/ui/button";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
-import { getPaidSessionFromCookies } from "@/lib/auth";
-
-type HomePageProps = {
-  searchParams: Promise<Record<string, string | string[] | undefined>>;
-};
-
-function one(value: string | string[] | undefined) {
-  if (Array.isArray(value)) {
-    return value[0] ?? "";
-  }
-  return value ?? "";
-}
-
-function safeDecode(value: string) {
-  try {
-    return decodeURIComponent(value);
-  } catch {
-    return value;
-  }
-}
+import { ArrowRight, FileArchive, ShieldCheck, TriangleAlert } from "lucide-react";
+import { PricingSection } from "@/components/pricing-section";
+import { UnlockAccessForm } from "@/components/unlock-access-form";
 
 const faqs = [
   {
-    question: "What exactly gets exported?",
+    question: "What data is included in each backup?",
     answer:
-      "Each backup includes charges, customers, subscriptions, payouts, invoices, and balance transactions in both CSV and JSON files, plus a manifest with timestamps and record counts."
+      "Each archive includes JSON and CSV files for customers, subscriptions, charges/transactions, and payouts. Files are timestamped and organized for audit or migration workflows."
   },
   {
-    question: "Will this work if my Stripe account is at risk?",
+    question: "How does purchase access work?",
     answer:
-      "Yes. As long as API access still works, you can generate exports immediately. The goal is to keep audit-ready records before limits, freezes, or shutdowns affect dashboard access."
+      "Checkout happens on Stripe using the hosted payment link. Once payment is confirmed via webhook, enter the same checkout email to unlock your dashboard cookie and manage backups."
   },
   {
-    question: "How fast is setup?",
+    question: "Can I run backups before a migration deadline?",
     answer:
-      "Most teams complete setup in under five minutes: complete checkout, verify purchase email, connect Stripe, then run your first backup."
+      "Yes. You can run a full backup on demand, then generate incremental snapshots so you keep a final, complete record right before cutover."
   },
   {
-    question: "Where are backup files stored?",
+    question: "Where are backup archives stored?",
     answer:
-      "Files are stored in S3 when credentials are configured. If not, files are stored on local disk so you can still download complete ZIP archives."
+      "Backups are stored locally by default. If AWS credentials are configured, archives are uploaded to S3 and download links are served as short-lived signed URLs."
   }
 ];
 
-export const dynamic = "force-dynamic";
-
-export default async function HomePage({ searchParams }: HomePageProps) {
-  const params = await searchParams;
-  const paywallError = one(params.paywallError);
-  const paymentLink = process.env.NEXT_PUBLIC_STRIPE_PAYMENT_LINK;
-  const paidSession = await getPaidSessionFromCookies();
-
+export default function HomePage() {
   return (
-    <main className="mx-auto min-h-screen w-full max-w-6xl px-4 py-8 sm:px-8">
-      <header className="flex items-center justify-between border-b border-[var(--border)] pb-6">
-        <div>
-          <p className="text-xs uppercase tracking-[0.18em] text-emerald-300">Business Tools</p>
-          <h1 className="mt-2 text-2xl font-bold">Stripe Account Backup</h1>
+    <main className="mx-auto flex w-full max-w-6xl flex-col gap-16 px-4 py-10 md:px-8 md:py-14">
+      <header className="rounded-2xl border border-slate-700 bg-slate-900/55 p-6 md:p-10">
+        <div className="inline-flex items-center gap-2 rounded-full border border-emerald-500/40 bg-emerald-500/10 px-3 py-1 text-xs font-semibold uppercase tracking-[0.18em] text-emerald-300">
+          <ShieldCheck className="h-3.5 w-3.5" />
+          Stripe data continuity
         </div>
-        {paidSession ? (
-          <Link className={buttonVariants({ variant: "default" })} href="/dashboard">
+
+        <h1 className="mt-5 max-w-4xl text-4xl font-semibold leading-tight text-white md:text-5xl">
+          Backup your Stripe data before account termination or migration risk.
+        </h1>
+
+        <p className="mt-5 max-w-3xl text-lg text-slate-300">
+          Stripe Account Backup automatically exports transactions, customers, subscriptions, and payouts into
+          structured CSV and JSON archives, so your financial history stays intact when you need it most.
+        </p>
+
+        <div className="mt-8 flex flex-col gap-3 sm:flex-row">
+          <a
+            href="#pricing"
+            className="inline-flex items-center justify-center gap-2 rounded-lg bg-emerald-400 px-5 py-3 text-sm font-semibold text-[#0d1117] transition hover:bg-emerald-300"
+          >
+            Start Protecting My Data
+            <ArrowRight className="h-4 w-4" />
+          </a>
+          <a
+            href="/dashboard"
+            className="inline-flex items-center justify-center rounded-lg border border-slate-600 bg-slate-900 px-5 py-3 text-sm font-semibold text-slate-100 transition hover:border-emerald-400 hover:text-emerald-300"
+          >
             Open Dashboard
-          </Link>
-        ) : null}
+          </a>
+        </div>
       </header>
 
-      <section className="grid gap-8 py-12 lg:grid-cols-[1.2fr_0.8fr] lg:items-center">
-        <div>
-          <p className="text-sm font-semibold uppercase tracking-[0.14em] text-emerald-300">Backup your Stripe data before account termination</p>
-          <h2 className="mt-4 text-4xl font-bold leading-tight sm:text-5xl">
-            Protect your full payment history before account freezes, migrations, or compliance audits.
+      <section className="grid gap-6 md:grid-cols-2">
+        <article className="rounded-xl border border-rose-500/30 bg-rose-950/25 p-6">
+          <h2 className="flex items-center gap-2 text-xl font-semibold text-rose-200">
+            <TriangleAlert className="h-5 w-5" />
+            The risk
           </h2>
-          <p className="mt-5 max-w-2xl text-base text-[var(--muted)] sm:text-lg">
-            Stripe Account Backup exports transactions, customers, subscriptions, payouts, and linked records into structured CSV and JSON bundles. Instead of piecing together manual exports, you get a complete archive in one click.
+          <p className="mt-3 text-sm leading-relaxed text-rose-100/85">
+            Stripe account reviews and sudden restrictions can block your access with minimal notice. Native exports are
+            fragmented across dashboards, are slow to assemble, and often miss relationships needed for taxes, chargeback
+            defense, and investor diligence.
           </p>
-          <div className="mt-8 flex flex-wrap items-center gap-4">
-            <a
-              className={buttonVariants({ variant: "default", size: "lg" })}
-              href={process.env.NEXT_PUBLIC_STRIPE_PAYMENT_LINK ?? "#"}
-              rel="noreferrer"
-              target="_blank"
-            >
-              Start for $15/month
-            </a>
-            <a className={buttonVariants({ variant: "outline", size: "lg" })} href="#verify-access">
-              I already purchased
-            </a>
+        </article>
+
+        <article className="rounded-xl border border-emerald-500/30 bg-emerald-950/20 p-6">
+          <h2 className="flex items-center gap-2 text-xl font-semibold text-emerald-200">
+            <FileArchive className="h-5 w-5" />
+            The solution
+          </h2>
+          <p className="mt-3 text-sm leading-relaxed text-emerald-100/90">
+            Connect Stripe once with read-only OAuth, run full and incremental backups on demand, and download one
+            archive containing all core payment records in machine-readable and spreadsheet-ready formats.
+          </p>
+        </article>
+      </section>
+
+      <section className="grid gap-4 md:grid-cols-3">
+        <div className="rounded-xl border border-slate-700 bg-slate-900/60 p-5">
+          <p className="text-xs uppercase tracking-[0.16em] text-slate-400">Who pays</p>
+          <p className="mt-2 text-sm text-slate-200">
+            SaaS founders and ecommerce operators processing $10K+ monthly who need reliable financial archives.
+          </p>
+        </div>
+        <div className="rounded-xl border border-slate-700 bg-slate-900/60 p-5">
+          <p className="text-xs uppercase tracking-[0.16em] text-slate-400">Best fit</p>
+          <p className="mt-2 text-sm text-slate-200">
+            High-risk verticals, migration planning, and teams preparing compliance or investor audits.
+          </p>
+        </div>
+        <div className="rounded-xl border border-slate-700 bg-slate-900/60 p-5">
+          <p className="text-xs uppercase tracking-[0.16em] text-slate-400">Time saved</p>
+          <p className="mt-2 text-sm text-slate-200">
+            Replace hours of manual exports with one-click archives and daily incremental snapshots.
+          </p>
+        </div>
+      </section>
+
+      <PricingSection />
+
+      <section className="grid gap-8 lg:grid-cols-[1.1fr_1fr]">
+        <div className="rounded-xl border border-slate-700 bg-slate-900/60 p-6">
+          <h2 className="text-2xl font-semibold text-white">Frequently asked questions</h2>
+          <div className="mt-5 space-y-4">
+            {faqs.map((faq) => (
+              <article key={faq.question} className="rounded-lg border border-slate-700 bg-[#101827] p-4">
+                <h3 className="text-sm font-semibold text-slate-100">{faq.question}</h3>
+                <p className="mt-2 text-sm text-slate-300">{faq.answer}</p>
+              </article>
+            ))}
           </div>
-          {!paymentLink ? (
-            <p className="mt-4 text-sm text-[var(--warning)]">
-              Set NEXT_PUBLIC_STRIPE_PAYMENT_LINK to enable checkout.
-            </p>
-          ) : null}
         </div>
 
-        <Card className="bg-[linear-gradient(160deg,rgba(35,134,54,0.18),rgba(13,17,23,0.92))]">
-          <CardHeader>
-            <CardTitle>Who this is for</CardTitle>
-            <CardDescription>
-              SaaS founders and ecommerce teams processing $10K+ monthly through Stripe.
-            </CardDescription>
-          </CardHeader>
-          <CardContent className="space-y-4 text-sm text-[var(--foreground)]">
-            <p>High-risk industries that need defensive recordkeeping.</p>
-            <p>Teams planning payment-provider migration with zero data loss.</p>
-            <p>Finance leads preparing tax filings, dispute evidence, or investor diligence.</p>
-            <p className="rounded-md border border-[var(--border)] bg-black/20 p-3 text-[var(--muted)]">
-              Stripe exports can be fragmented and slow for relationship-heavy data. This tool creates complete, organized backups in one archive.
-            </p>
-          </CardContent>
-        </Card>
-      </section>
-
-      <section className="grid gap-6 py-8 md:grid-cols-3">
-        <Card>
-          <CardHeader>
-            <CardTitle>Problem</CardTitle>
-          </CardHeader>
-          <CardContent className="text-sm text-[var(--muted)]">
-            Manual exports take hours, break relationships across objects, and often miss payout or balance-transaction context needed for audits and disputes.
-          </CardContent>
-        </Card>
-        <Card>
-          <CardHeader>
-            <CardTitle>Solution</CardTitle>
-          </CardHeader>
-          <CardContent className="text-sm text-[var(--muted)]">
-            Connect Stripe once, generate on-demand backups, and download complete ZIP archives with CSV/JSON outputs ready for finance operations.
-          </CardContent>
-        </Card>
-        <Card>
-          <CardHeader>
-            <CardTitle>Value</CardTitle>
-          </CardHeader>
-          <CardContent className="text-sm text-[var(--muted)]">
-            Keep independent, audit-ready records under your control before account issues, compliance reviews, or migration deadlines create urgency.
-          </CardContent>
-        </Card>
-      </section>
-
-      <section className="grid gap-8 py-8 lg:grid-cols-[1fr_1fr]" id="verify-access">
-        <Card>
-          <CardHeader>
-            <CardTitle>Pricing</CardTitle>
-            <CardDescription>Simple monthly access with unlimited manual backups.</CardDescription>
-          </CardHeader>
-          <CardContent>
-            <p className="text-4xl font-bold">$15<span className="text-lg font-medium text-[var(--muted)]">/month</span></p>
-            <ul className="mt-5 space-y-3 text-sm text-[var(--foreground)]">
-              <li>Complete Stripe object coverage in one archive</li>
-              <li>CSV and JSON output for finance and engineering workflows</li>
-              <li>Dashboard download history for repeatable recordkeeping</li>
-              <li>Optional internal daily scheduler support</li>
-            </ul>
-            <a
-              className={`${buttonVariants({ variant: "default", size: "lg" })} mt-6 w-full`}
-              href={process.env.NEXT_PUBLIC_STRIPE_PAYMENT_LINK ?? "#"}
-              rel="noreferrer"
-              target="_blank"
-            >
-              Buy on Stripe Checkout
-            </a>
-          </CardContent>
-        </Card>
-
-        <Card>
-          <CardHeader>
-            <CardTitle>Unlock Dashboard</CardTitle>
-            <CardDescription>
-              After checkout, verify with the same email used in Stripe payment.
-            </CardDescription>
-          </CardHeader>
-          <CardContent>
-            <form action="/api/paywall/verify" className="space-y-4" method="post">
-              <label className="block text-sm text-[var(--muted)]" htmlFor="email">
-                Purchase email
-              </label>
-              <input
-                className="w-full rounded-md border border-[var(--border)] bg-[var(--card-strong)] px-3 py-2 text-sm outline-none ring-0 focus:border-emerald-400"
-                id="email"
-                name="email"
-                placeholder="founder@company.com"
-                required
-                type="email"
-              />
-              <Button className="w-full" type="submit">
-                Verify Payment & Enter Dashboard
-              </Button>
-            </form>
-            {paywallError ? (
-              <p className="mt-4 rounded-md border border-red-500/40 bg-red-500/10 p-3 text-sm text-red-200">
-                {safeDecode(paywallError)}
-              </p>
-            ) : (
-              <p className="mt-4 text-sm text-[var(--muted)]">
-                If your payment was just completed, verification can take a few seconds while Stripe webhook events sync.
-              </p>
-            )}
-          </CardContent>
-        </Card>
-      </section>
-
-      <section className="py-8">
-        <h3 className="text-2xl font-bold">FAQ</h3>
-        <div className="mt-5 grid gap-4">
-          {faqs.map((faq) => (
-            <Card key={faq.question}>
-              <CardHeader>
-                <CardTitle className="text-lg">{faq.question}</CardTitle>
-              </CardHeader>
-              <CardContent className="text-sm text-[var(--muted)]">{faq.answer}</CardContent>
-            </Card>
-          ))}
-        </div>
+        <UnlockAccessForm />
       </section>
     </main>
   );

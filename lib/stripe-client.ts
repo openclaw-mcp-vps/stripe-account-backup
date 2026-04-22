@@ -1,108 +1,75 @@
 import Stripe from "stripe";
+import { getUserByEmail } from "@/lib/database";
 
-export type StripeOAuthExchangeResult = Stripe.OAuthToken & {
-  access_token: string;
-  stripe_user_id: string;
-  scope: string;
-  livemode: boolean;
-};
+const STRIPE_API_VERSION = "2024-06-20" as Stripe.LatestApiVersion;
 
-export function getPlatformStripeClient() {
+function createClient(secretKey: string): Stripe {
+  return new Stripe(secretKey, {
+    apiVersion: STRIPE_API_VERSION
+  });
+}
+
+export function getPlatformStripeClient(): Stripe {
   const secretKey = process.env.STRIPE_SECRET_KEY;
+
   if (!secretKey) {
     throw new Error("Missing STRIPE_SECRET_KEY environment variable.");
   }
 
-  return new Stripe(secretKey, {
-    appInfo: {
-      name: "Stripe Account Backup",
-      version: "1.0.0"
-    }
-  });
+  return createClient(secretKey);
 }
 
-export function createConnectedStripeClient(accessToken: string) {
-  return new Stripe(accessToken, {
-    appInfo: {
-      name: "Stripe Account Backup",
-      version: "1.0.0"
-    }
+export async function exchangeStripeOAuthCode(code: string): Promise<{
+  stripeUserId: string;
+  accessToken: string;
+  refreshToken: string;
+  scope: string;
+  livemode: boolean;
+}> {
+  const stripe = getPlatformStripeClient();
+  const response = await stripe.oauth.token({
+    grant_type: "authorization_code",
+    code
   });
-}
 
-export function getAppBaseUrl(requestUrl: string) {
-  if (process.env.APP_BASE_URL) {
-    return process.env.APP_BASE_URL;
+  if (!response.stripe_user_id || !response.access_token || !response.refresh_token) {
+    throw new Error("Stripe OAuth token response did not contain expected account credentials.");
   }
 
-  try {
-    const url = new URL(requestUrl);
-    return `${url.protocol}//${url.host}`;
-  } catch {
-    return "http://localhost:3000";
-  }
+  return {
+    stripeUserId: response.stripe_user_id,
+    accessToken: response.access_token,
+    refreshToken: response.refresh_token,
+    scope: response.scope ?? "read_only",
+    livemode: Boolean(response.livemode)
+  };
 }
 
-export function buildStripeConnectAuthorizeUrl(params: {
-  requestUrl: string;
-  state: string;
-}) {
-  const clientId = process.env.STRIPE_CLIENT_ID;
+export async function getUserStripeClient(email: string): Promise<Stripe> {
+  const user = await getUserByEmail(email);
+
+  if (!user?.stripeAccessToken) {
+    throw new Error("Stripe account is not connected yet.");
+  }
+
+  return createClient(user.stripeAccessToken);
+}
+
+export function buildStripeConnectAuthorizeUrl(baseUrl: string, state: string): string {
+  const clientId = process.env.STRIPE_CONNECT_CLIENT_ID;
+
   if (!clientId) {
-    throw new Error("Missing STRIPE_CLIENT_ID environment variable.");
+    throw new Error("Missing STRIPE_CONNECT_CLIENT_ID environment variable.");
   }
 
-  const baseUrl = getAppBaseUrl(params.requestUrl);
-  const redirectUri = `${baseUrl}/api/stripe/connect`;
-
-  const search = new URLSearchParams({
+  const callbackUrl = `${baseUrl}/api/stripe/connect`;
+  const params = new URLSearchParams({
     response_type: "code",
     client_id: clientId,
     scope: "read_only",
-    state: params.state,
-    redirect_uri: redirectUri
+    state,
+    redirect_uri: callbackUrl
   });
 
-  return `https://connect.stripe.com/oauth/authorize?${search.toString()}`;
-}
-
-export async function exchangeStripeOAuthCode(params: {
-  code: string;
-}): Promise<StripeOAuthExchangeResult> {
-  const stripe = getPlatformStripeClient();
-
-  const oauth = await stripe.oauth.token({
-    grant_type: "authorization_code",
-    code: params.code
-  });
-
-  if (!oauth.stripe_user_id || !oauth.access_token) {
-    throw new Error("Stripe OAuth response did not include required account data.");
-  }
-
-  return {
-    ...oauth,
-    access_token: oauth.access_token,
-    stripe_user_id: oauth.stripe_user_id,
-    scope: oauth.scope ?? "",
-    livemode: oauth.livemode ?? false
-  };
-}
-
-export async function retrieveConnectedAccountProfile(accessToken: string) {
-  const stripe = createConnectedStripeClient(accessToken);
-  const account = await stripe.accounts.retrieve();
-
-  const displayName =
-    account.business_profile?.name ??
-    account.settings?.dashboard?.display_name ??
-    account.company?.name ??
-    null;
-
-  const email = account.email ?? null;
-
-  return {
-    displayName,
-    email
-  };
+  return `https://connect.stripe.com/oauth/authorize?${params.toString()}`;
 }

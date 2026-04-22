@@ -11,7 +11,7 @@ NICHE: business-tools
 PRICE: $$15/mo
 
 ARCHITECTURE SPEC:
-A Next.js web app that connects to users' Stripe accounts via OAuth, fetches all account data through Stripe's API, and generates downloadable backup files. The app uses scheduled jobs to create automated backups and stores file metadata in a database while keeping actual backup files in cloud storage.
+A Next.js web app that connects to users' Stripe accounts via OAuth, fetches all account data through Stripe's API, and generates downloadable backup archives. The app uses scheduled jobs to perform incremental backups and stores metadata in a database while keeping actual backup files in cloud storage.
 
 PLANNED FILES:
 - app/page.tsx
@@ -19,17 +19,18 @@ PLANNED FILES:
 - app/api/stripe/connect/route.ts
 - app/api/stripe/webhook/route.ts
 - app/api/backup/create/route.ts
-- app/api/backup/download/[id]/route.ts
-- components/stripe-connect-button.tsx
-- components/backup-list.tsx
-- components/backup-progress.tsx
+- app/api/backup/download/route.ts
+- app/api/lemonsqueezy/webhook/route.ts
 - lib/stripe-client.ts
 - lib/backup-generator.ts
 - lib/database.ts
-- lib/storage.ts
-- lib/auth.ts
+- components/stripe-connect-button.tsx
+- components/backup-dashboard.tsx
+- components/pricing-section.tsx
+- types/stripe-data.ts
+- utils/data-formatter.ts
 
-DEPENDENCIES: next, react, typescript, tailwindcss, stripe, @lemonsqueezy/lemonsqueezy.js, prisma, @prisma/client, next-auth, aws-sdk, csv-writer, archiver, cron, zod
+DEPENDENCIES: next, react, typescript, tailwindcss, stripe, @lemonsqueezy/lemonsqueezy.js, prisma, @prisma/client, next-auth, archiver, csv-writer, aws-sdk, node-cron, zod, lucide-react
 
 REQUIREMENTS:
 - Next.js 15 with App Router (app/ directory)

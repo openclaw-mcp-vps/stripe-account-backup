@@ -1,357 +1,302 @@
-import { PassThrough } from "node:stream";
-
+import { createWriteStream } from "node:fs";
+import { mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import cron from "node-cron";
 import archiver from "archiver";
-import { CronJob } from "cron";
-import { createObjectCsvStringifier } from "csv-writer";
-
+import { createObjectCsvWriter } from "csv-writer";
+import AWS from "aws-sdk";
+import type Stripe from "stripe";
+import type { BackupKind, StripeBackupData } from "@/types/stripe-data";
 import {
   completeBackupRecord,
   createBackupRecord,
   failBackupRecord,
-  listConnectedPaidUsers,
-  type BackupSummary,
-  type StripeConnectionRecord
+  listBackupsByEmail,
+  listPaidConnectedUsers,
+  type BackupRecord
 } from "@/lib/database";
-import { storeBackupArchive } from "@/lib/storage";
-import { createConnectedStripeClient } from "@/lib/stripe-client";
+import { getUserStripeClient } from "@/lib/stripe-client";
+import {
+  mapCustomersToCsvRows,
+  mapPayoutsToCsvRows,
+  mapSubscriptionsToCsvRows,
+  mapTransactionsToCsvRows
+} from "@/utils/data-formatter";
 
-type StripeRecord = {
-  id?: string;
-};
+const BACKUP_DIR = path.join(process.cwd(), "data", "backups");
 
-type BackupDataSet = {
-  charges: StripeRecord[];
-  customers: StripeRecord[];
-  subscriptions: StripeRecord[];
-  payouts: StripeRecord[];
-  balanceTransactions: StripeRecord[];
-  invoices: StripeRecord[];
-};
-
-let scheduler: CronJob | null = null;
-let scheduledRun: Promise<number> | null = null;
-
-function safeString(value: unknown) {
-  if (value === null || value === undefined) {
-    return "";
-  }
-
-  if (typeof value === "string") {
-    return value;
-  }
-
-  if (typeof value === "number" || typeof value === "boolean") {
-    return String(value);
-  }
-
-  return JSON.stringify(value);
+function slugifyEmail(email: string): string {
+  return email.replace(/[^a-z0-9]/gi, "-").toLowerCase();
 }
 
-function toCsv(data: StripeRecord[]) {
-  if (data.length === 0) {
-    return "id\n";
+function buildBackupFileName(email: string): string {
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+
+  return `stripe-backup-${slugifyEmail(email)}-${stamp}.zip`;
+}
+
+async function getIncrementalSinceTimestamp(email: string): Promise<number | null> {
+  const backups = await listBackupsByEmail(email);
+  const completed = backups.find((backup) => backup.status === "completed");
+
+  if (!completed) {
+    return null;
   }
 
-  const rows = data.map((entry) => {
-    const raw = entry as Record<string, unknown>;
-    const row: Record<string, string> = {};
-    Object.entries(raw).forEach(([key, value]) => {
-      row[key] = safeString(value);
-    });
-    return row;
-  });
-
-  const headers = Array.from(
-    new Set(rows.flatMap((row) => Object.keys(row)))
-  );
-
-  const csvStringifier = createObjectCsvStringifier({
-    header: headers.map((column) => ({ id: column, title: column }))
-  });
-
-  return csvStringifier.getHeaderString() + csvStringifier.stringifyRecords(rows);
+  return Math.floor(new Date(completed.createdAt).getTime() / 1000);
 }
 
-function serializeRecords<T>(records: T[]) {
-  return JSON.parse(JSON.stringify(records)) as T[];
+async function fetchStripeData(email: string, kind: BackupKind): Promise<StripeBackupData> {
+  const stripe = await getUserStripeClient(email);
+  const sinceTimestamp = kind === "incremental" ? await getIncrementalSinceTimestamp(email) : null;
+
+  const createdFilter = sinceTimestamp
+    ? ({
+        created: {
+          gte: sinceTimestamp
+        }
+      } as const)
+    : {};
+
+  const customers = await stripe.customers
+    .list({
+      limit: 100,
+      ...createdFilter
+    })
+    .autoPagingToArray({ limit: 10000 });
+
+  const subscriptions = await stripe.subscriptions
+    .list({
+      status: "all",
+      limit: 100,
+      ...createdFilter
+    })
+    .autoPagingToArray({ limit: 10000 });
+
+  const payouts = await stripe.payouts
+    .list({
+      limit: 100,
+      ...createdFilter
+    })
+    .autoPagingToArray({ limit: 10000 });
+
+  const transactions = await stripe.charges
+    .list({
+      limit: 100,
+      ...createdFilter
+    })
+    .autoPagingToArray({ limit: 10000 });
+
+  return {
+    customers,
+    subscriptions,
+    payouts,
+    transactions
+  };
 }
 
-async function buildZipArchive(files: {
-  name: string;
-  content: string | Buffer;
-}[]) {
-  return new Promise<Buffer>((resolve, reject) => {
-    const output = new PassThrough();
+async function writeJsonFile(filePath: string, payload: unknown): Promise<void> {
+  await writeFile(filePath, JSON.stringify(payload, null, 2), "utf-8");
+}
+
+async function writeCsvExports(exportDir: string, data: StripeBackupData): Promise<void> {
+  const customers = mapCustomersToCsvRows(data.customers);
+  const subscriptions = mapSubscriptionsToCsvRows(data.subscriptions);
+  const payouts = mapPayoutsToCsvRows(data.payouts);
+  const transactions = mapTransactionsToCsvRows(data.transactions);
+
+  await createObjectCsvWriter({
+    path: path.join(exportDir, "customers.csv"),
+    header: [
+      { id: "id", title: "ID" },
+      { id: "email", title: "EMAIL" },
+      { id: "name", title: "NAME" },
+      { id: "createdAt", title: "CREATED_AT" },
+      { id: "currency", title: "CURRENCY" },
+      { id: "delinquent", title: "DELINQUENT" }
+    ]
+  }).writeRecords(customers);
+
+  await createObjectCsvWriter({
+    path: path.join(exportDir, "subscriptions.csv"),
+    header: [
+      { id: "id", title: "ID" },
+      { id: "customerId", title: "CUSTOMER_ID" },
+      { id: "status", title: "STATUS" },
+      { id: "currentPeriodStart", title: "CURRENT_PERIOD_START" },
+      { id: "currentPeriodEnd", title: "CURRENT_PERIOD_END" },
+      { id: "cancelAtPeriodEnd", title: "CANCEL_AT_PERIOD_END" },
+      { id: "amount", title: "AMOUNT" },
+      { id: "currency", title: "CURRENCY" }
+    ]
+  }).writeRecords(subscriptions);
+
+  await createObjectCsvWriter({
+    path: path.join(exportDir, "payouts.csv"),
+    header: [
+      { id: "id", title: "ID" },
+      { id: "amount", title: "AMOUNT" },
+      { id: "currency", title: "CURRENCY" },
+      { id: "status", title: "STATUS" },
+      { id: "arrivalDate", title: "ARRIVAL_DATE" },
+      { id: "createdAt", title: "CREATED_AT" },
+      { id: "method", title: "METHOD" }
+    ]
+  }).writeRecords(payouts);
+
+  await createObjectCsvWriter({
+    path: path.join(exportDir, "transactions.csv"),
+    header: [
+      { id: "id", title: "ID" },
+      { id: "amount", title: "AMOUNT" },
+      { id: "currency", title: "CURRENCY" },
+      { id: "status", title: "STATUS" },
+      { id: "paid", title: "PAID" },
+      { id: "customerId", title: "CUSTOMER_ID" },
+      { id: "description", title: "DESCRIPTION" },
+      { id: "createdAt", title: "CREATED_AT" }
+    ]
+  }).writeRecords(transactions);
+}
+
+async function createZipArchive(sourceDir: string, zipPath: string): Promise<void> {
+  await mkdir(path.dirname(zipPath), { recursive: true });
+
+  await new Promise<void>((resolve, reject) => {
+    const output = createWriteStream(zipPath);
     const archive = archiver("zip", { zlib: { level: 9 } });
-    const chunks: Buffer[] = [];
 
-    output.on("data", (chunk) => {
-      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
-    });
-
-    output.on("end", () => {
-      resolve(Buffer.concat(chunks));
-    });
-
-    archive.on("error", (error) => {
-      reject(error);
-    });
+    output.on("close", () => resolve());
+    output.on("error", (error) => reject(error));
+    archive.on("error", (error) => reject(error));
 
     archive.pipe(output);
-
-    for (const file of files) {
-      archive.append(file.content, { name: file.name });
-    }
-
-    const finalizeResult = archive.finalize();
-    if (finalizeResult && typeof (finalizeResult as Promise<void>).catch === "function") {
-      (finalizeResult as Promise<void>).catch((error) => reject(error));
-    }
+    archive.directory(sourceDir, false);
+    void archive.finalize();
   });
 }
 
-async function listAllPages<T extends StripeRecord>(
-  fetchPage: (startingAfter?: string) => Promise<{
-    data: T[];
-    has_more: boolean;
-  }>
-) {
-  const items: T[] = [];
-  let hasMore = true;
-  let cursor: string | undefined;
+async function storeArchive(zipPath: string, fileName: string): Promise<{
+  storageProvider: "local" | "s3";
+  storagePath: string;
+  sizeBytes: number;
+}> {
+  const stats = await stat(zipPath);
+  const bucket = process.env.AWS_S3_BUCKET;
 
-  while (hasMore) {
-    const page = await fetchPage(cursor);
-    items.push(...page.data);
-    hasMore = page.has_more;
-    cursor = page.data[page.data.length - 1]?.id;
+  if (bucket && process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY) {
+    const region = process.env.AWS_REGION || "us-east-1";
+    const s3 = new AWS.S3({ region });
+    const key = `stripe-account-backup/${fileName}`;
 
-    if (!cursor && hasMore) {
-      hasMore = false;
-    }
+    await s3
+      .putObject({
+        Bucket: bucket,
+        Key: key,
+        Body: await readFile(zipPath),
+        ContentType: "application/zip"
+      })
+      .promise();
+
+    return {
+      storageProvider: "s3",
+      storagePath: key,
+      sizeBytes: stats.size
+    };
   }
 
-  return items;
-}
-
-async function collectStripeData(accessToken: string): Promise<BackupDataSet> {
-  const stripe = createConnectedStripeClient(accessToken);
-
-  async function safeCollect<T extends StripeRecord>(
-    collector: () => Promise<T[]>
-  ): Promise<T[]> {
-    try {
-      return await collector();
-    } catch {
-      return [];
-    }
-  }
-
-  const [charges, customers, subscriptions, payouts, balanceTransactions, invoices] =
-    await Promise.all([
-      safeCollect(() =>
-        listAllPages((startingAfter) =>
-          stripe.charges.list({
-            limit: 100,
-            ...(startingAfter ? { starting_after: startingAfter } : {})
-          })
-        )
-      ),
-      safeCollect(() =>
-        listAllPages((startingAfter) =>
-          stripe.customers.list({
-            limit: 100,
-            ...(startingAfter ? { starting_after: startingAfter } : {})
-          })
-        )
-      ),
-      safeCollect(() =>
-        listAllPages((startingAfter) =>
-          stripe.subscriptions.list({
-            status: "all",
-            limit: 100,
-            ...(startingAfter ? { starting_after: startingAfter } : {})
-          })
-        )
-      ),
-      safeCollect(() =>
-        listAllPages((startingAfter) =>
-          stripe.payouts.list({
-            limit: 100,
-            ...(startingAfter ? { starting_after: startingAfter } : {})
-          })
-        )
-      ),
-      safeCollect(() =>
-        listAllPages((startingAfter) =>
-          stripe.balanceTransactions.list({
-            limit: 100,
-            ...(startingAfter ? { starting_after: startingAfter } : {})
-          })
-        )
-      ),
-      safeCollect(() =>
-        listAllPages((startingAfter) =>
-          stripe.invoices.list({
-            limit: 100,
-            ...(startingAfter ? { starting_after: startingAfter } : {})
-          })
-        )
-      )
-    ]);
+  await mkdir(BACKUP_DIR, { recursive: true });
+  const localPath = path.join(BACKUP_DIR, fileName);
+  await writeFile(localPath, await readFile(zipPath));
 
   return {
-    charges: serializeRecords(charges),
-    customers: serializeRecords(customers),
-    subscriptions: serializeRecords(subscriptions),
-    payouts: serializeRecords(payouts),
-    balanceTransactions: serializeRecords(balanceTransactions),
-    invoices: serializeRecords(invoices)
+    storageProvider: "local",
+    storagePath: localPath,
+    sizeBytes: stats.size
   };
 }
 
-function getSummary(data: BackupDataSet): BackupSummary {
-  return {
-    charges: data.charges.length,
-    customers: data.customers.length,
-    subscriptions: data.subscriptions.length,
-    payouts: data.payouts.length,
-    balanceTransactions: data.balanceTransactions.length,
-    invoices: data.invoices.length
-  };
+async function exportBackupData(tempExportDir: string, data: StripeBackupData): Promise<void> {
+  await writeJsonFile(path.join(tempExportDir, "customers.json"), data.customers);
+  await writeJsonFile(path.join(tempExportDir, "subscriptions.json"), data.subscriptions);
+  await writeJsonFile(path.join(tempExportDir, "payouts.json"), data.payouts);
+  await writeJsonFile(path.join(tempExportDir, "transactions.json"), data.transactions);
+  await writeCsvExports(tempExportDir, data);
 }
 
-function buildArchiveFiles(params: {
-  stripeUserId: string;
-  generatedAt: string;
-  data: BackupDataSet;
-}) {
-  const summary = getSummary(params.data);
+export async function createBackupForEmail(email: string, kind: BackupKind): Promise<BackupRecord> {
+  const fileName = buildBackupFileName(email);
+  const record = await createBackupRecord({ email, kind, fileName });
 
-  const files: { name: string; content: string }[] = [
-    {
-      name: "manifest.json",
-      content: JSON.stringify(
-        {
-          generatedAt: params.generatedAt,
-          stripeUserId: params.stripeUserId,
-          datasets: summary
-        },
-        null,
-        2
-      )
-    }
-  ];
+  const tempRoot = await mkdir(path.join(os.tmpdir(), `stripe-backup-${record.id}`), {
+    recursive: true
+  }).then(() => path.join(os.tmpdir(), `stripe-backup-${record.id}`));
 
-  const entries: [keyof BackupDataSet, string][] = [
-    ["charges", "charges"],
-    ["customers", "customers"],
-    ["subscriptions", "subscriptions"],
-    ["payouts", "payouts"],
-    ["balanceTransactions", "balance-transactions"],
-    ["invoices", "invoices"]
-  ];
-
-  for (const [key, folderName] of entries) {
-    const records = params.data[key];
-    files.push({
-      name: `json/${folderName}.json`,
-      content: JSON.stringify(records, null, 2)
-    });
-    files.push({
-      name: `csv/${folderName}.csv`,
-      content: toCsv(records)
-    });
-  }
-
-  return {
-    files,
-    summary
-  };
-}
-
-export async function createStripeBackup(params: {
-  userId: string;
-  stripeConnection: StripeConnectionRecord;
-}) {
-  const backup = await createBackupRecord(params.userId);
+  const exportDir = path.join(tempRoot, "export");
+  const zipPath = path.join(tempRoot, fileName);
 
   try {
-    const generatedAt = new Date().toISOString();
-    const data = await collectStripeData(params.stripeConnection.accessToken);
-    const archive = buildArchiveFiles({
-      stripeUserId: params.stripeConnection.stripeUserId,
-      generatedAt,
-      data
-    });
+    await mkdir(exportDir, { recursive: true });
+    const data = await fetchStripeData(email, kind);
 
-    const zipBuffer = await buildZipArchive(archive.files);
-    const storage = await storeBackupArchive({
-      userId: params.userId,
-      backupId: backup.id,
-      archive: zipBuffer
-    });
+    await exportBackupData(exportDir, data);
+    await createZipArchive(exportDir, zipPath);
 
-    const completed = await completeBackupRecord(backup.id, {
-      fileName: storage.fileName,
-      storageKey: storage.storageKey,
-      sizeBytes: storage.sizeBytes,
-      summary: archive.summary
+    const storage = await storeArchive(zipPath, fileName);
+    const completed = await completeBackupRecord({
+      backupId: record.id,
+      email,
+      storageProvider: storage.storageProvider,
+      storagePath: storage.storagePath,
+      sizeBytes: storage.sizeBytes
     });
 
     if (!completed) {
-      throw new Error("Backup metadata could not be finalized.");
+      throw new Error("Backup metadata disappeared before completion.");
     }
 
     return completed;
   } catch (error) {
-    const message = error instanceof Error ? error.message : "Unexpected backup failure";
-    await failBackupRecord(backup.id, message);
+    const message = error instanceof Error ? error.message : "Unknown backup error";
+    await failBackupRecord({
+      backupId: record.id,
+      email,
+      error: message
+    });
     throw error;
+  } finally {
+    await rm(tempRoot, { recursive: true, force: true });
   }
 }
 
-export function ensureBackupSchedulerRunning() {
-  if (scheduler || process.env.ENABLE_INTERNAL_CRON !== "true") {
+export function initBackupScheduler(): void {
+  const globalState = globalThis as typeof globalThis & {
+    __stripeBackupSchedulerStarted?: boolean;
+  };
+
+  if (globalState.__stripeBackupSchedulerStarted) {
     return;
   }
 
-  const expression = process.env.BACKUP_CRON_SCHEDULE ?? "0 3 * * *";
+  globalState.__stripeBackupSchedulerStarted = true;
 
-  scheduler = new CronJob(expression, async () => {
-    await runScheduledBackupsNow();
-  });
+  cron.schedule(
+    "17 2 * * *",
+    async () => {
+      const users = await listPaidConnectedUsers();
 
-  scheduler.start();
-}
-
-export async function runScheduledBackupsNow() {
-  if (scheduledRun) {
-    return scheduledRun;
-  }
-
-  scheduledRun = (async () => {
-    const connectedUsers = await listConnectedPaidUsers();
-    let completed = 0;
-
-    for (const entry of connectedUsers) {
-      try {
-        await createStripeBackup({
-          userId: entry.user.id,
-          stripeConnection: entry.connection
-        });
-        completed += 1;
-      } catch {
-        // Individual backup failures should not cancel the entire scheduled batch.
+      for (const user of users) {
+        try {
+          await createBackupForEmail(user.email, "incremental");
+        } catch (error) {
+          const message = error instanceof Error ? error.message : "Unknown scheduler error";
+          console.error(`Scheduled backup failed for ${user.email}: ${message}`);
+        }
       }
+    },
+    {
+      timezone: "UTC"
     }
-
-    return completed;
-  })();
-
-  scheduledRun.finally(() => {
-    scheduledRun = null;
-  });
-
-  return scheduledRun;
+  );
 }
